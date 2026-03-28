@@ -1,0 +1,389 @@
+#!/bin/bash
+# ============================================================================
+# process-spec.sh — Spec Processing Pipeline
+#
+# Chains three Claude Code invocations with true context isolation:
+#   Phase 1: REFINER  — Reconcile spec against real codebase
+#   Phase 2: CRITIC   — Independent critique of refined spec
+#   Phase 3: ASSEMBLER — Merge findings into final spec
+#
+# Usage:
+#   ./process-spec.sh path/to/your-spec.md
+#   ./process-spec.sh path/to/your-spec.md --skip-assembly
+#   ./process-spec.sh path/to/your-spec.md --verbose
+#
+# Output:
+#   .spec-pipeline/
+#     refined-spec.md          — Phase 1 output
+#     reconciliation-report.md — Phase 1 findings
+#     critique-report.md       — Phase 2 findings
+#     final-spec.md            — Phase 3 assembled output
+#
+# Requirements:
+#   - Claude Code CLI (claude) installed and authenticated
+#   - Run from the root of your project (where CLAUDE.md lives)
+# ============================================================================
+
+set -uo pipefail
+
+# ── Args ─────────────────────────────────────────────────────────────────────
+
+SPEC_PATH="${1:?Usage: ./process-spec.sh path/to/spec.md [--skip-assembly] [--verbose]}"
+SKIP_ASSEMBLY=false
+VERBOSE=false
+
+for arg in "$@"; do
+  case "$arg" in
+    --skip-assembly) SKIP_ASSEMBLY=true ;;
+    --verbose) VERBOSE=true ;;
+  esac
+done
+
+if [ ! -f "$SPEC_PATH" ]; then
+  echo "Error: Spec file not found: $SPEC_PATH"
+  exit 1
+fi
+
+SPEC_NAME=$(basename "$SPEC_PATH" .md)
+OUTPUT_DIR=".spec-pipeline"
+mkdir -p "$OUTPUT_DIR"
+
+echo ""
+echo "======================================================"
+echo "  SPEC PROCESSING PIPELINE"
+echo "======================================================"
+echo ""
+echo "  Spec:   $SPEC_PATH"
+echo "  Output: $OUTPUT_DIR/"
+echo ""
+
+# ── Phase 1: REFINER ────────────────────────────────────────────────────────
+
+echo "------------------------------------------------------"
+echo "  PHASE 1: REFINER — Reconciling spec against codebase"
+echo "------------------------------------------------------"
+echo ""
+
+IFS= read -r -d '' REFINER_PROMPT <<'REFINER_EOF' || true
+You are the REFINER. Your job is to reconcile a feature spec against the real codebase.
+
+Read the spec file at: SPEC_PATH_PLACEHOLDER
+
+Then systematically verify every claim the spec makes against the actual code. You have full read access to the codebase. Use the project's CLAUDE.md and any documentation files for context.
+
+CHECK EACH OF THESE:
+
+1. TYPE ACCURACY
+   - Every interface/type referenced — do the field names match the real code? Are nullability assumptions correct?
+   - Are there fields the spec assumes exist that don't? Fields that exist but the spec doesn't account for?
+
+2. COMPONENT & SERVICE EXISTENCE
+   - Every component, hook, service, or utility the spec references — does it actually exist in the codebase?
+   - If it doesn't exist, is it clearly marked as "to be created" in the spec?
+   - Are import paths plausible given the actual file structure?
+
+3. NAVIGATION & ROUTING
+   - Route names, screen names, navigation params — do they match the real navigator/router setup?
+   - Are route param types correct?
+
+4. STORAGE & DATA PATTERNS
+   - Storage keys, database tables, or cache keys referenced — do they match the real code?
+   - Storage service method signatures — do they match?
+   - Data sync behavior — is the spec correct about what persists where?
+
+5. ANALYTICS & TELEMETRY
+   - Event names — are they consistent with the naming conventions used elsewhere in the codebase?
+   - Property names and types — do they follow existing patterns?
+   - Are there missing events that similar features track?
+
+6. API CONTRACTS
+   - Request/response shapes for any API routes — do they match the actual route handlers?
+   - Are rate limits, timeouts, and error codes accurate?
+
+7. FILE MANIFEST
+   - The list of files to create/modify — is it complete?
+   - Are there files that would obviously need changes but aren't listed?
+
+8. EXISTING PATTERNS
+   - Does the spec follow patterns established elsewhere in the codebase, or does it introduce unnecessary divergence?
+   - Are there existing utilities or helpers the spec should use but doesn't mention?
+
+PRODUCE TWO OUTPUTS:
+
+1. Write the reconciliation report to: OUTPUT_DIR_PLACEHOLDER/reconciliation-report.md
+   Format: grouped by category above, each finding tagged as:
+   - MISMATCH: spec says X, code says Y (must fix)
+   - MISSING: spec references something that doesn't exist yet (flag for creation)
+   - SUGGESTION: spec works but could be better
+   - VERIFIED: spot-checked and correct
+
+2. Write the refined spec to: OUTPUT_DIR_PLACEHOLDER/refined-spec.md
+   This is the original spec with all MISMATCH issues fixed inline.
+   Do NOT fix MISSING or SUGGESTION items — just flag them in the report.
+
+Be thorough. Read actual source files. Don't guess — verify.
+REFINER_EOF
+
+REFINER_PROMPT="${REFINER_PROMPT//SPEC_PATH_PLACEHOLDER/$SPEC_PATH}"
+REFINER_PROMPT="${REFINER_PROMPT//OUTPUT_DIR_PLACEHOLDER/$OUTPUT_DIR}"
+
+claude -p "$REFINER_PROMPT" \
+  --allowedTools "Read,Grep,Glob,Write" \
+  --max-turns 40 \
+  --output-format text \
+  > "$OUTPUT_DIR/refiner-log.txt" 2>&1 || true
+
+if [ "$VERBOSE" = true ] && [ -f "$OUTPUT_DIR/refiner-log.txt" ]; then
+  echo "  [verbose] Last 20 lines of refiner log:"
+  tail -20 "$OUTPUT_DIR/refiner-log.txt"
+  echo ""
+fi
+
+if [ ! -f "$OUTPUT_DIR/reconciliation-report.md" ]; then
+  echo "  Warning: Refiner didn't produce reconciliation-report.md"
+  echo "  Check $OUTPUT_DIR/refiner-log.txt for details"
+else
+  echo "  Phase 1 complete"
+  echo "    -> $OUTPUT_DIR/reconciliation-report.md"
+  echo "    -> $OUTPUT_DIR/refined-spec.md"
+fi
+echo ""
+
+# ── Phase 2: CRITIC ─────────────────────────────────────────────────────────
+
+echo "------------------------------------------------------"
+echo "  PHASE 2: CRITIC — Independent review of refined spec"
+echo "------------------------------------------------------"
+echo ""
+
+CRITIC_INPUT="$OUTPUT_DIR/refined-spec.md"
+if [ ! -f "$CRITIC_INPUT" ]; then
+  CRITIC_INPUT="$SPEC_PATH"
+  echo "  (Using original spec — refiner didn't produce refined version)"
+fi
+
+IFS= read -r -d '' CRITIC_PROMPT <<'CRITIC_EOF' || true
+You are the CRITIC. You are reviewing a feature spec that has already been through a codebase reconciliation pass. You did NOT do that reconciliation — you are a fresh reviewer with no prior context.
+
+Read the spec at: CRITIC_INPUT_PLACEHOLDER
+Also read the reconciliation report at: OUTPUT_DIR_PLACEHOLDER/reconciliation-report.md (if it exists)
+
+Read the project's CLAUDE.md and any relevant documentation to understand established patterns and conventions.
+
+Your job is to find problems the Refiner missed. You're looking for DIFFERENT things than the Refiner:
+
+1. STORY ATOMICITY
+   - Are implementation stories actually atomic? (2-5 files per story is the sweet spot)
+   - Can each story be implemented and tested independently?
+   - Are there hidden dependencies between stories that aren't declared?
+
+2. EDGE CASES
+   - What happens on first use (empty state)?
+   - What happens with no network?
+   - What happens if the user is unauthenticated?
+   - What happens if data is in an unexpected shape?
+   - What happens if the user does things out of order?
+
+3. ACCEPTANCE CRITERIA
+   - Does every story have clear "done" criteria?
+   - Could two developers disagree on whether a story is complete?
+   - Are there implicit UX decisions that should be explicit?
+
+4. SCOPE
+   - Is anything over-scoped for what the feature actually needs?
+   - Are there gold-plated requirements that could be deferred?
+   - Conversely, is anything critical missing?
+
+5. GUARDRAILS
+   - Do "do not touch" guardrails make sense?
+   - Are they too broad (blocking necessary changes) or too narrow (missing things that shouldn't change)?
+
+6. SEQUENCING
+   - If stories are ordered, does the order make sense?
+   - Does story N depend on something from story N+2?
+   - Could any stories be parallelized?
+
+7. UX GAPS
+   - Loading states — are they specified?
+   - Error states — what does the user see?
+   - Transitions — how does the user get into and out of this feature?
+   - Accessibility — touch targets, contrast, screen reader considerations?
+
+8. ANALYTICS GAPS
+   - Are there user decisions that should be tracked but aren't?
+   - Do the events answer the product questions the feature is trying to answer?
+
+9. CODEBASE CONVENTIONS
+   - Does the spec follow existing naming conventions used in the codebase?
+   - Does the spec reuse existing components/hooks where it should, or does it reinvent something that already exists?
+   - Are guardrails consistent with how other specs in this project scope their boundaries?
+
+10. UX INTENT CLARITY
+    - Are interaction patterns explicit enough that the Assembler can't accidentally change them?
+    - Where the spec says "toast" does it mean toast, or could someone interpret it as a banner?
+    - Are transitions described precisely (e.g., "bottom sheet slides up" vs "modal opens")?
+    - Flag any UX behavior that's implied but not stated — these are where drift happens downstream.
+
+PRODUCE ONE OUTPUT:
+
+Write your critique to: OUTPUT_DIR_PLACEHOLDER/critique-report.md
+
+Format each finding as:
+- CRITICAL: Must fix before implementation
+- IMPORTANT: Should fix, but won't block implementation
+- NICE-TO-HAVE: Worth considering for a future pass
+- WELL DONE: Call out things the spec does right (reinforce good patterns)
+
+End with a SUMMARY section: your overall assessment of spec readiness.
+Is it ready for implementation? Ready with minor fixes? Needs another pass?
+
+Be constructive. The goal is to make the spec better, not to find fault.
+CRITIC_EOF
+
+CRITIC_PROMPT="${CRITIC_PROMPT//CRITIC_INPUT_PLACEHOLDER/$CRITIC_INPUT}"
+CRITIC_PROMPT="${CRITIC_PROMPT//OUTPUT_DIR_PLACEHOLDER/$OUTPUT_DIR}"
+
+claude -p "$CRITIC_PROMPT" \
+  --allowedTools "Read,Grep,Glob,Write" \
+  --max-turns 25 \
+  --output-format text \
+  > "$OUTPUT_DIR/critic-log.txt" 2>&1 || true
+
+if [ "$VERBOSE" = true ] && [ -f "$OUTPUT_DIR/critic-log.txt" ]; then
+  echo "  [verbose] Last 20 lines of critic log:"
+  tail -20 "$OUTPUT_DIR/critic-log.txt"
+  echo ""
+fi
+
+if [ ! -f "$OUTPUT_DIR/critique-report.md" ]; then
+  echo "  Warning: Critic didn't produce critique-report.md"
+  echo "  Check $OUTPUT_DIR/critic-log.txt for details"
+else
+  echo "  Phase 2 complete"
+  echo "    -> $OUTPUT_DIR/critique-report.md"
+fi
+echo ""
+
+# ── Phase 3: ASSEMBLER (optional) ───────────────────────────────────────────
+
+if [ "$SKIP_ASSEMBLY" = true ]; then
+  echo "------------------------------------------------------"
+  echo "  PHASE 3: SKIPPED (--skip-assembly)"
+  echo "------------------------------------------------------"
+else
+  echo "------------------------------------------------------"
+  echo "  PHASE 3: ASSEMBLER — Producing final spec"
+  echo "------------------------------------------------------"
+  echo ""
+
+  IFS= read -r -d '' ASSEMBLER_PROMPT <<'ASSEMBLER_EOF' || true
+You are the ASSEMBLER. Your job is to produce the final, implementation-ready spec.
+
+You have three inputs:
+1. The refined spec: OUTPUT_DIR_PLACEHOLDER/refined-spec.md
+2. The reconciliation report: OUTPUT_DIR_PLACEHOLDER/reconciliation-report.md
+3. The critique report: OUTPUT_DIR_PLACEHOLDER/critique-report.md
+
+If the refined spec doesn't exist, use the original spec at: SPEC_PATH_PLACEHOLDER
+
+Read all three.
+
+YOUR TASK:
+
+1. Start from the refined spec as the base.
+
+2. Address all CRITICAL findings from the critique report:
+   - Fix them directly in the spec
+
+3. For IMPORTANT findings from the critique:
+   - If the fix is small and obvious, apply it
+   - If it requires a design decision, add a DECISION NEEDED comment
+
+4. For MISSING findings from the reconciliation report:
+   - Ensure they're clearly called out in the file manifest as "to be created"
+
+5. Add a Pipeline Metadata section at the bottom with:
+   - Date processed
+   - Count of findings by severity from both reports
+   - Any unresolved DECISION NEEDED items
+   - Overall readiness assessment
+
+CONSTRAINTS — The Assembler may only change:
+- Type names, field names, storage keys, API contracts (factual corrections)
+- Missing edge case documentation (additive)
+- Story sequencing and dependency declarations (structural)
+- Acceptance criteria (additive)
+
+The Assembler may NOT change:
+- UX behavior (interaction patterns, navigation flows, what the user sees)
+- Component hierarchy or screen layout
+- Copy or messaging
+- Which analytics events fire and when
+
+Any finding that would change UX behavior must become a DECISION NEEDED comment.
+
+Write the final spec to: OUTPUT_DIR_PLACEHOLDER/final-spec.md
+
+This spec should be ready to hand directly to an AI coding assistant for implementation.
+ASSEMBLER_EOF
+
+  ASSEMBLER_PROMPT="${ASSEMBLER_PROMPT//OUTPUT_DIR_PLACEHOLDER/$OUTPUT_DIR}"
+  ASSEMBLER_PROMPT="${ASSEMBLER_PROMPT//SPEC_PATH_PLACEHOLDER/$SPEC_PATH}"
+
+  claude -p "$ASSEMBLER_PROMPT" \
+    --allowedTools "Read,Write" \
+    --max-turns 15 \
+    --output-format text \
+    > "$OUTPUT_DIR/assembler-log.txt" 2>&1 || true
+
+  if [ "$VERBOSE" = true ] && [ -f "$OUTPUT_DIR/assembler-log.txt" ]; then
+    echo "  [verbose] Last 20 lines of assembler log:"
+    tail -20 "$OUTPUT_DIR/assembler-log.txt"
+    echo ""
+  fi
+
+  if [ ! -f "$OUTPUT_DIR/final-spec.md" ]; then
+    echo "  Warning: Assembler didn't produce final-spec.md"
+    echo "  Check $OUTPUT_DIR/assembler-log.txt for details"
+  else
+    echo "  Phase 3 complete"
+    echo "    -> $OUTPUT_DIR/final-spec.md"
+  fi
+fi
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+echo ""
+echo "======================================================"
+echo "  PIPELINE COMPLETE"
+echo "======================================================"
+echo ""
+echo "  Outputs in $OUTPUT_DIR/:"
+echo ""
+
+for f in "$OUTPUT_DIR"/*.md; do
+  [ -e "$f" ] && echo "    $(basename "$f")"
+done
+
+echo ""
+echo "  Logs:"
+
+for f in "$OUTPUT_DIR"/*-log.txt; do
+  [ -e "$f" ] && echo "    $(basename "$f")"
+done
+
+echo ""
+echo "  Next steps:"
+if [ -f "$OUTPUT_DIR/final-spec.md" ]; then
+  echo "    1. Review final-spec.md"
+  echo '    2. Resolve any DECISION NEEDED comments'
+  echo "    3. Hand to your AI coding assistant for implementation"
+elif [ -f "$OUTPUT_DIR/refined-spec.md" ]; then
+  echo "    1. Review reconciliation-report.md + critique-report.md"
+  echo "    2. Update refined-spec.md based on findings"
+  echo "    3. Hand to your AI coding assistant for implementation"
+else
+  echo "    1. Check the log files for errors"
+  echo "    2. Re-run the pipeline"
+fi
+echo ""
