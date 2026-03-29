@@ -2,14 +2,17 @@
 # ============================================================================
 # process-spec.sh — Spec Processing Pipeline
 #
-# Chains three Claude Code invocations with true context isolation:
-#   Phase 1: REFINER  — Reconcile spec against real codebase
-#   Phase 2: CRITIC   — Independent critique of refined spec
-#   Phase 3: ASSEMBLER — Merge findings into final spec
+# Chains five Claude Code invocations with true context isolation:
+#   Phase 1: REFINER       — Reconcile spec against real codebase
+#   Phase 2: CRITIC        — Independent critique of refined spec
+#   Phase 3: ASSEMBLER     — Merge findings into final spec
+#   Phase 4: SECOND CRITIC — Fresh review of final spec for implementation readiness
+#   Phase 5: RESOLVER      — Classify and resolve second critic findings
 #
 # Usage:
 #   ./process-spec.sh path/to/your-spec.md
 #   ./process-spec.sh path/to/your-spec.md --skip-assembly
+#   ./process-spec.sh path/to/your-spec.md --full
 #   ./process-spec.sh path/to/your-spec.md --verbose
 #
 # Output:
@@ -17,7 +20,9 @@
 #     refined-spec.md          — Phase 1 output
 #     reconciliation-report.md — Phase 1 findings
 #     critique-report.md       — Phase 2 findings
-#     final-spec.md            — Phase 3 assembled output
+#     final-spec.md            — Phase 3 assembled output (updated by Phase 5)
+#     final-review.md          — Phase 4 findings
+#     resolution-log.md        — Phase 5 disposition of each finding
 #
 # Requirements:
 #   - Claude Code CLI (claude) installed and authenticated
@@ -28,13 +33,15 @@ set -uo pipefail
 
 # ── Args ─────────────────────────────────────────────────────────────────────
 
-SPEC_PATH="${1:?Usage: ./process-spec.sh path/to/spec.md [--skip-assembly] [--verbose]}"
+SPEC_PATH="${1:?Usage: ./process-spec.sh path/to/spec.md [--skip-assembly] [--full] [--verbose]}"
 SKIP_ASSEMBLY=false
+FULL=false
 VERBOSE=false
 
 for arg in "$@"; do
   case "$arg" in
     --skip-assembly) SKIP_ASSEMBLY=true ;;
+    --full) FULL=true ;;
     --verbose) VERBOSE=true ;;
   esac
 done
@@ -350,6 +357,147 @@ ASSEMBLER_EOF
     echo "    -> $OUTPUT_DIR/final-spec.md"
   fi
 fi
+echo ""
+
+# ── Phase 4: SECOND CRITIC (optional) ─────────────────────────────────────
+
+if [ "$SKIP_ASSEMBLY" = true ] || [ "$FULL" != true ]; then
+  echo "------------------------------------------------------"
+  echo "  PHASE 4: SKIPPED (use --full to enable)"
+  echo "------------------------------------------------------"
+else
+  echo "------------------------------------------------------"
+  echo "  PHASE 4: SECOND CRITIC — Fresh review of final spec"
+  echo "------------------------------------------------------"
+  echo ""
+
+  IFS= read -r -d '' SECOND_CRITIC_PROMPT <<'SECOND_CRITIC_EOF' || true
+You are a senior engineer reviewing a spec you have never seen before. You have zero context about the pipeline or process that produced it.
+
+Read the spec at: OUTPUT_DIR_PLACEHOLDER/final-spec.md
+
+Also read the project's CLAUDE.md and any relevant documentation to understand the codebase you'd be implementing against.
+
+Evaluate this spec for implementation readiness. Your review should answer:
+
+1. Could a competent engineer pick this up and start building tomorrow?
+2. Are there ambiguities that would cause two engineers to build different things?
+3. Are there missing details that would force the implementer to make design decisions the spec should have made?
+4. Are there internal contradictions?
+5. Are acceptance criteria testable and unambiguous?
+6. Are edge cases covered, or are there obvious gaps?
+7. Is the scope reasonable, or is it trying to do too much / too little?
+8. Does the technical approach make sense given the actual codebase?
+
+Flag real problems, not nitpicks. Every finding should be something that would actually cause issues during implementation.
+
+For each finding, state:
+- What the problem is
+- Where in the spec it occurs
+- Why it matters for implementation
+- A suggested fix (if you have one)
+
+Write your review to: OUTPUT_DIR_PLACEHOLDER/final-review.md
+SECOND_CRITIC_EOF
+
+  SECOND_CRITIC_PROMPT="${SECOND_CRITIC_PROMPT//OUTPUT_DIR_PLACEHOLDER/$OUTPUT_DIR}"
+
+  claude -p "$SECOND_CRITIC_PROMPT" \
+    --allowedTools "Read,Grep,Glob,Write" \
+    --max-turns 25 \
+    --output-format text \
+    > "$OUTPUT_DIR/second-critic-log.txt" 2>&1 || true
+
+  if [ "$VERBOSE" = true ] && [ -f "$OUTPUT_DIR/second-critic-log.txt" ]; then
+    echo "  [verbose] Last 20 lines of second critic log:"
+    tail -20 "$OUTPUT_DIR/second-critic-log.txt"
+    echo ""
+  fi
+
+  if [ ! -f "$OUTPUT_DIR/final-review.md" ]; then
+    echo "  Warning: Second Critic didn't produce final-review.md"
+    echo "  Check $OUTPUT_DIR/second-critic-log.txt for details"
+  else
+    echo "  Phase 4 complete"
+    echo "    -> $OUTPUT_DIR/final-review.md"
+  fi
+fi
+echo ""
+
+# ── Phase 5: RESOLVER (optional) ──────────────────────────────────────────
+
+if [ "$SKIP_ASSEMBLY" = true ] || [ "$FULL" != true ]; then
+  echo "------------------------------------------------------"
+  echo "  PHASE 5: SKIPPED (use --full to enable)"
+  echo "------------------------------------------------------"
+else
+  echo "------------------------------------------------------"
+  echo "  PHASE 5: RESOLVER — Resolving review findings"
+  echo "------------------------------------------------------"
+  echo ""
+
+  IFS= read -r -d '' RESOLVER_PROMPT <<'RESOLVER_EOF' || true
+You are the RESOLVER. Your job is to process the findings from a final review and apply fixes to the spec.
+
+Read these two files:
+1. The spec: OUTPUT_DIR_PLACEHOLDER/final-spec.md
+2. The review: OUTPUT_DIR_PLACEHOLDER/final-review.md
+
+For EACH finding in the review, classify it as one of:
+- VALID: The finding is correct and you can fix it. Apply the fix directly in the spec.
+- NITPICK: The finding is stylistic or trivial. Ignore it.
+- REQUIRES DECISION: The finding raises a real issue but fixing it would require a product or design decision. Add a DECISION NEEDED comment in the spec at the relevant location.
+
+CONSTRAINTS — The Resolver may only change:
+- Type names, field names, storage keys, API contracts (factual corrections)
+- Missing edge case documentation (additive)
+- Story sequencing and dependency declarations (structural)
+- Acceptance criteria (tighten or add, never remove)
+- Missing documentation (additive)
+
+The Resolver may NOT change:
+- UX behavior (interaction patterns, navigation flows, what the user sees)
+- Component hierarchy or screen layout
+- Copy or messaging
+- Which analytics events fire and when
+
+Any finding that would require changing UX behavior must be classified as REQUIRES DECISION.
+
+PRODUCE TWO OUTPUTS:
+
+1. Overwrite the spec at: OUTPUT_DIR_PLACEHOLDER/final-spec.md
+   Apply all VALID fixes. Add DECISION NEEDED comments for REQUIRES DECISION items.
+
+2. Write the resolution log to: OUTPUT_DIR_PLACEHOLDER/resolution-log.md
+   For each finding from the review, list:
+   - The finding (brief summary)
+   - Classification: VALID, NITPICK, or REQUIRES DECISION
+   - Action taken (what you changed, or why you skipped it)
+RESOLVER_EOF
+
+  RESOLVER_PROMPT="${RESOLVER_PROMPT//OUTPUT_DIR_PLACEHOLDER/$OUTPUT_DIR}"
+
+  claude -p "$RESOLVER_PROMPT" \
+    --allowedTools "Read,Write" \
+    --max-turns 15 \
+    --output-format text \
+    > "$OUTPUT_DIR/resolver-log.txt" 2>&1 || true
+
+  if [ "$VERBOSE" = true ] && [ -f "$OUTPUT_DIR/resolver-log.txt" ]; then
+    echo "  [verbose] Last 20 lines of resolver log:"
+    tail -20 "$OUTPUT_DIR/resolver-log.txt"
+    echo ""
+  fi
+
+  if [ ! -f "$OUTPUT_DIR/resolution-log.md" ]; then
+    echo "  Warning: Resolver didn't produce resolution-log.md"
+    echo "  Check $OUTPUT_DIR/resolver-log.txt for details"
+  else
+    echo "  Phase 5 complete"
+    echo "    -> $OUTPUT_DIR/final-spec.md (updated)"
+    echo "    -> $OUTPUT_DIR/resolution-log.md"
+  fi
+fi
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 
@@ -374,7 +522,11 @@ done
 
 echo ""
 echo "  Next steps:"
-if [ -f "$OUTPUT_DIR/final-spec.md" ]; then
+if [ -f "$OUTPUT_DIR/resolution-log.md" ]; then
+  echo "    1. Review resolution-log.md for finding dispositions"
+  echo '    2. Resolve any DECISION NEEDED comments in final-spec.md'
+  echo "    3. Hand to your AI coding assistant for implementation"
+elif [ -f "$OUTPUT_DIR/final-spec.md" ]; then
   echo "    1. Review final-spec.md"
   echo '    2. Resolve any DECISION NEEDED comments'
   echo "    3. Hand to your AI coding assistant for implementation"
