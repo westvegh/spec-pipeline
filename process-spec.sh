@@ -478,7 +478,7 @@ RESOLVER_EOF
   RESOLVER_PROMPT="${RESOLVER_PROMPT//OUTPUT_DIR_PLACEHOLDER/$OUTPUT_DIR}"
 
   claude -p "$RESOLVER_PROMPT" \
-    --allowedTools "Read,Write" \
+    --allowedTools "Read,Write,Edit" \
     --max-turns 15 \
     --output-format text \
     > "$OUTPUT_DIR/resolver-log.txt" 2>&1 || true
