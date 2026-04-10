@@ -71,10 +71,13 @@ echo "  PHASE 1: REFINER — Reconciling spec against codebase"
 echo "------------------------------------------------------"
 echo ""
 
+cp "$SPEC_PATH" "$OUTPUT_DIR/refined-spec.md"
+
 IFS= read -r -d '' REFINER_PROMPT <<'REFINER_EOF' || true
 You are the REFINER. Your job is to reconcile a feature spec against the real codebase.
 
-Read the spec file at: SPEC_PATH_PLACEHOLDER
+The original spec has already been copied to: OUTPUT_DIR_PLACEHOLDER/refined-spec.md
+You will edit that file in place. Read it first to see the content.
 
 Then systematically verify every claim the spec makes against the actual code. You have full read access to the codebase. Use the project's CLAUDE.md and any documentation files for context.
 
@@ -124,9 +127,10 @@ PRODUCE TWO OUTPUTS:
    - SUGGESTION: spec works but could be better
    - VERIFIED: spot-checked and correct
 
-2. Write the refined spec to: OUTPUT_DIR_PLACEHOLDER/refined-spec.md
-   This is the original spec with all MISMATCH issues fixed inline.
-   Do NOT fix MISSING or SUGGESTION items — just flag them in the report.
+2. Edit OUTPUT_DIR_PLACEHOLDER/refined-spec.md in place to fix every MISMATCH inline.
+   - Use the Edit tool for surgical fixes — do NOT rewrite the whole file with Write unless the changes are so pervasive that editing would be impractical.
+   - Before fixing a renamed type, field, or symbol, Grep the spec for ALL occurrences so you catch every instance, not just the first one.
+   - Do NOT fix MISSING or SUGGESTION items — just flag them in the report.
 
 Be thorough. Read actual source files. Don't guess — verify.
 REFINER_EOF
@@ -135,7 +139,7 @@ REFINER_PROMPT="${REFINER_PROMPT//SPEC_PATH_PLACEHOLDER/$SPEC_PATH}"
 REFINER_PROMPT="${REFINER_PROMPT//OUTPUT_DIR_PLACEHOLDER/$OUTPUT_DIR}"
 
 claude -p "$REFINER_PROMPT" \
-  --allowedTools "Read,Grep,Glob,Write" \
+  --allowedTools "Read,Grep,Glob,Write,Edit" \
   --max-turns 40 \
   --output-format text \
   > "$OUTPUT_DIR/refiner-log.txt" 2>&1 || true
@@ -283,21 +287,26 @@ else
   echo "------------------------------------------------------"
   echo ""
 
+  if [ -f "$OUTPUT_DIR/refined-spec.md" ]; then
+    cp "$OUTPUT_DIR/refined-spec.md" "$OUTPUT_DIR/final-spec.md"
+  else
+    cp "$SPEC_PATH" "$OUTPUT_DIR/final-spec.md"
+  fi
+
   IFS= read -r -d '' ASSEMBLER_PROMPT <<'ASSEMBLER_EOF' || true
 You are the ASSEMBLER. Your job is to produce the final, implementation-ready spec.
 
 You have three inputs:
-1. The refined spec: OUTPUT_DIR_PLACEHOLDER/refined-spec.md
-2. The reconciliation report: OUTPUT_DIR_PLACEHOLDER/reconciliation-report.md
-3. The critique report: OUTPUT_DIR_PLACEHOLDER/critique-report.md
-
-If the refined spec doesn't exist, use the original spec at: SPEC_PATH_PLACEHOLDER
+1. The reconciliation report: OUTPUT_DIR_PLACEHOLDER/reconciliation-report.md
+2. The critique report: OUTPUT_DIR_PLACEHOLDER/critique-report.md
+3. The working spec to edit: OUTPUT_DIR_PLACEHOLDER/final-spec.md
+   (This has already been seeded with the refined spec, or the original spec if refining failed.)
 
 Read all three.
 
 YOUR TASK:
 
-1. Start from the refined spec as the base.
+1. The working spec at OUTPUT_DIR_PLACEHOLDER/final-spec.md is your starting point — edit it in place.
 
 2. Address all CRITICAL findings from the critique report:
    - Fix them directly in the spec
@@ -329,7 +338,7 @@ The Assembler may NOT change:
 
 Any finding that would change UX behavior must become a DECISION NEEDED comment.
 
-Write the final spec to: OUTPUT_DIR_PLACEHOLDER/final-spec.md
+Edit OUTPUT_DIR_PLACEHOLDER/final-spec.md in place. Use the Edit tool for surgical changes — do NOT rewrite the whole file with Write unless the changes are so pervasive that editing would be impractical. Before fixing a renamed symbol or recurring pattern, Grep the spec to catch every occurrence.
 
 This spec should be ready to hand directly to an AI coding assistant for implementation.
 ASSEMBLER_EOF
@@ -338,8 +347,8 @@ ASSEMBLER_EOF
   ASSEMBLER_PROMPT="${ASSEMBLER_PROMPT//SPEC_PATH_PLACEHOLDER/$SPEC_PATH}"
 
   claude -p "$ASSEMBLER_PROMPT" \
-    --allowedTools "Read,Write" \
-    --max-turns 15 \
+    --allowedTools "Read,Grep,Glob,Write,Edit" \
+    --max-turns 25 \
     --output-format text \
     > "$OUTPUT_DIR/assembler-log.txt" 2>&1 || true
 
@@ -479,7 +488,7 @@ RESOLVER_EOF
 
   claude -p "$RESOLVER_PROMPT" \
     --allowedTools "Read,Write,Edit" \
-    --max-turns 15 \
+    --max-turns 25 \
     --output-format text \
     > "$OUTPUT_DIR/resolver-log.txt" 2>&1 || true
 
