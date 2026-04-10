@@ -28,7 +28,7 @@ echo "  Copied process-spec.sh"
 
 # Copy slash command
 mkdir -p "$TARGET/.claude/commands"
-cp "$SCRIPT_DIR/.claude/commands/process-spec.md" "$TARGET/.claude/commands/process-spec.md"
+cp "$SCRIPT_DIR/process-spec.md" "$TARGET/.claude/commands/process-spec.md"
 echo "  Copied .claude/commands/process-spec.md"
 
 # Add to .gitignore if not already there
