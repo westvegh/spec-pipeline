@@ -51,9 +51,73 @@ if [ ! -f "$SPEC_PATH" ]; then
   exit 1
 fi
 
+command -v jq >/dev/null || { echo "Error: jq is required (install via 'brew install jq')"; exit 1; }
+
 SPEC_NAME=$(basename "$SPEC_PATH" .md)
 OUTPUT_DIR=".spec-pipeline"
 mkdir -p "$OUTPUT_DIR"
+
+PROJECT_ROOT="$(pwd)"
+
+# jq filter that consumes stream-json line-by-line and emits one short line per
+# tool-call, plus banners for session init and run result. Tolerates malformed
+# lines via try/catch.
+read -r -d '' JQ_FILTER <<'JQ_EOF' || true
+def strip_root($r):
+  if type != "string" then ""
+  elif startswith($r + "/") then .[($r|length)+1:]
+  else . end;
+
+def truncate($n):
+  if type != "string" then ""
+  elif (. | length) > $n then (.[0:$n-1]) + "…"
+  else . end;
+
+def file_path_of(input):
+  (input.file_path // input.filePath // "") | strip_root($root);
+
+def target(tool; input):
+  if   tool == "Read"         then file_path_of(input)
+  elif tool == "Edit"         then file_path_of(input)
+  elif tool == "Write"        then file_path_of(input)
+  elif tool == "MultiEdit"    then file_path_of(input)
+  elif tool == "NotebookEdit" then (input.notebook_path // input.notebookPath // "") | strip_root($root)
+  elif tool == "Grep"         then "\"" + (input.pattern // "") + "\""
+  elif tool == "Glob"         then "\"" + (input.pattern // "") + "\""
+  elif tool == "Bash"         then (input.command // "" | gsub("\n"; " ⏎ ") | truncate(60))
+  elif tool == "WebFetch"     then input.url // ""
+  elif tool == "WebSearch"    then "\"" + (input.query // "") + "\""
+  elif tool == "Task"         then (input.description // input.subagent_type // "")
+  elif tool == "TodoWrite"    then "updated todo list"
+  else (input | tostring | truncate(60))
+  end;
+
+( try fromjson catch null ) as $e
+| if $e == null then empty
+  elif $e.type == "system" and $e.subtype == "init" then
+       "    (session \($e.session_id // "?" | .[0:8]))"
+  elif $e.type == "assistant" then
+       ( $e.message.content // [] )
+       | map(select(.type == "tool_use"))
+       | .[]
+       | "    → \(.name) \( target(.name; (.input // {})) )"
+  elif $e.type == "result" and $e.subtype == "success" and ($e.is_error != true) then
+       "    ✓ done  (\($e.num_turns // 0) turns, $\($e.total_cost_usd // 0 | tostring))"
+  elif $e.type == "result" then
+       "    ✗ \($e.subtype // "error")\(if $e.is_error then " [is_error]" else "" end) (\($e.num_turns // 0) turns)"
+  else empty end
+JQ_EOF
+
+# stream_claude_phase <slug>
+#   Reads stream-json on stdin.
+#   Tees raw JSONL to $OUTPUT_DIR/<slug>-events.jsonl (faithful record).
+#   Emits formatted tool-call lines to stdout AND $OUTPUT_DIR/<slug>-log.txt.
+stream_claude_phase() {
+  local slug="$1"
+  tee "$OUTPUT_DIR/${slug}-events.jsonl" \
+    | jq --unbuffered -rR --arg root "$PROJECT_ROOT" "$JQ_FILTER" \
+    | tee "$OUTPUT_DIR/${slug}-log.txt"
+}
 
 echo ""
 echo "======================================================"
@@ -118,19 +182,26 @@ CHECK EACH OF THESE:
    - Does the spec follow patterns established elsewhere in the codebase, or does it introduce unnecessary divergence?
    - Are there existing utilities or helpers the spec should use but doesn't mention?
 
-PRODUCE TWO OUTPUTS:
+FOLLOW THIS ORDER STRICTLY — the report is the most valuable artifact, so write it BEFORE touching the spec:
 
-1. Write the reconciliation report to: OUTPUT_DIR_PLACEHOLDER/reconciliation-report.md
-   Format: grouped by category above, each finding tagged as:
-   - MISMATCH: spec says X, code says Y (must fix)
-   - MISSING: spec references something that doesn't exist yet (flag for creation)
-   - SUGGESTION: spec works but could be better
-   - VERIFIED: spot-checked and correct
+STEP 1 — VERIFY
+  Do all your verification work first: Read the spec, Read relevant source files, Grep for symbols and patterns, confirm every claim.
 
-2. Edit OUTPUT_DIR_PLACEHOLDER/refined-spec.md in place to fix every MISMATCH inline.
-   - Use the Edit tool for surgical fixes — do NOT rewrite the whole file with Write unless the changes are so pervasive that editing would be impractical.
-   - Before fixing a renamed type, field, or symbol, Grep the spec for ALL occurrences so you catch every instance, not just the first one.
-   - Do NOT fix MISSING or SUGGESTION items — just flag them in the report.
+STEP 2 — WRITE THE REPORT (do this BEFORE any edits)
+  Write the reconciliation report to: OUTPUT_DIR_PLACEHOLDER/reconciliation-report.md
+  Format: grouped by category above, each finding tagged as:
+  - MISMATCH: spec says X, code says Y (must fix)
+  - MISSING: spec references something that doesn't exist yet (flag for creation)
+  - SUGGESTION: spec works but could be better
+  - VERIFIED: spot-checked and correct
+
+  This report MUST exist before you do any editing. If you run low on turns, the report is the thing that must survive — the edits can be redone from it later.
+
+STEP 3 — APPLY EDITS
+  Edit OUTPUT_DIR_PLACEHOLDER/refined-spec.md in place to fix every MISMATCH inline.
+  - Use the Edit tool for surgical fixes — do NOT rewrite the whole file with Write unless the changes are so pervasive that editing would be impractical.
+  - Before fixing a renamed type, field, or symbol, Grep the spec for ALL occurrences so you catch every instance, not just the first one.
+  - Do NOT fix MISSING or SUGGESTION items — just flag them in the report.
 
 Be thorough. Read actual source files. Don't guess — verify.
 REFINER_EOF
@@ -138,21 +209,25 @@ REFINER_EOF
 REFINER_PROMPT="${REFINER_PROMPT//SPEC_PATH_PLACEHOLDER/$SPEC_PATH}"
 REFINER_PROMPT="${REFINER_PROMPT//OUTPUT_DIR_PLACEHOLDER/$OUTPUT_DIR}"
 
+rm -f "$OUTPUT_DIR/reconciliation-report.md"
+
 claude -p "$REFINER_PROMPT" \
   --allowedTools "Read,Grep,Glob,Write,Edit" \
-  --max-turns 40 \
-  --output-format text \
-  > "$OUTPUT_DIR/refiner-log.txt" 2>&1 || true
+  --max-turns 80 \
+  --verbose --output-format stream-json \
+  2> "$OUTPUT_DIR/refiner-stderr.txt" \
+  | stream_claude_phase refiner \
+  || true
 
-if [ "$VERBOSE" = true ] && [ -f "$OUTPUT_DIR/refiner-log.txt" ]; then
-  echo "  [verbose] Last 20 lines of refiner log:"
-  tail -20 "$OUTPUT_DIR/refiner-log.txt"
+if [ "$VERBOSE" = true ] && [ -f "$OUTPUT_DIR/refiner-events.jsonl" ]; then
+  echo "  [verbose] Last 20 events of refiner stream:"
+  tail -20 "$OUTPUT_DIR/refiner-events.jsonl"
   echo ""
 fi
 
 if [ ! -f "$OUTPUT_DIR/reconciliation-report.md" ]; then
   echo "  Warning: Refiner didn't produce reconciliation-report.md"
-  echo "  Check $OUTPUT_DIR/refiner-log.txt for details"
+  echo "  Check $OUTPUT_DIR/refiner-events.jsonl and $OUTPUT_DIR/refiner-stderr.txt for details"
 else
   echo "  Phase 1 complete"
   echo "    -> $OUTPUT_DIR/reconciliation-report.md"
@@ -254,21 +329,25 @@ CRITIC_EOF
 CRITIC_PROMPT="${CRITIC_PROMPT//CRITIC_INPUT_PLACEHOLDER/$CRITIC_INPUT}"
 CRITIC_PROMPT="${CRITIC_PROMPT//OUTPUT_DIR_PLACEHOLDER/$OUTPUT_DIR}"
 
+rm -f "$OUTPUT_DIR/critique-report.md"
+
 claude -p "$CRITIC_PROMPT" \
   --allowedTools "Read,Grep,Glob,Write" \
   --max-turns 25 \
-  --output-format text \
-  > "$OUTPUT_DIR/critic-log.txt" 2>&1 || true
+  --verbose --output-format stream-json \
+  2> "$OUTPUT_DIR/critic-stderr.txt" \
+  | stream_claude_phase critic \
+  || true
 
-if [ "$VERBOSE" = true ] && [ -f "$OUTPUT_DIR/critic-log.txt" ]; then
-  echo "  [verbose] Last 20 lines of critic log:"
-  tail -20 "$OUTPUT_DIR/critic-log.txt"
+if [ "$VERBOSE" = true ] && [ -f "$OUTPUT_DIR/critic-events.jsonl" ]; then
+  echo "  [verbose] Last 20 events of critic stream:"
+  tail -20 "$OUTPUT_DIR/critic-events.jsonl"
   echo ""
 fi
 
 if [ ! -f "$OUTPUT_DIR/critique-report.md" ]; then
   echo "  Warning: Critic didn't produce critique-report.md"
-  echo "  Check $OUTPUT_DIR/critic-log.txt for details"
+  echo "  Check $OUTPUT_DIR/critic-events.jsonl and $OUTPUT_DIR/critic-stderr.txt for details"
 else
   echo "  Phase 2 complete"
   echo "    -> $OUTPUT_DIR/critique-report.md"
@@ -349,18 +428,20 @@ ASSEMBLER_EOF
   claude -p "$ASSEMBLER_PROMPT" \
     --allowedTools "Read,Grep,Glob,Write,Edit" \
     --max-turns 25 \
-    --output-format text \
-    > "$OUTPUT_DIR/assembler-log.txt" 2>&1 || true
+    --verbose --output-format stream-json \
+    2> "$OUTPUT_DIR/assembler-stderr.txt" \
+    | stream_claude_phase assembler \
+    || true
 
-  if [ "$VERBOSE" = true ] && [ -f "$OUTPUT_DIR/assembler-log.txt" ]; then
-    echo "  [verbose] Last 20 lines of assembler log:"
-    tail -20 "$OUTPUT_DIR/assembler-log.txt"
+  if [ "$VERBOSE" = true ] && [ -f "$OUTPUT_DIR/assembler-events.jsonl" ]; then
+    echo "  [verbose] Last 20 events of assembler stream:"
+    tail -20 "$OUTPUT_DIR/assembler-events.jsonl"
     echo ""
   fi
 
   if [ ! -f "$OUTPUT_DIR/final-spec.md" ]; then
     echo "  Warning: Assembler didn't produce final-spec.md"
-    echo "  Check $OUTPUT_DIR/assembler-log.txt for details"
+    echo "  Check $OUTPUT_DIR/assembler-events.jsonl and $OUTPUT_DIR/assembler-stderr.txt for details"
   else
     echo "  Phase 3 complete"
     echo "    -> $OUTPUT_DIR/final-spec.md"
@@ -411,21 +492,25 @@ SECOND_CRITIC_EOF
 
   SECOND_CRITIC_PROMPT="${SECOND_CRITIC_PROMPT//OUTPUT_DIR_PLACEHOLDER/$OUTPUT_DIR}"
 
+  rm -f "$OUTPUT_DIR/final-review.md"
+
   claude -p "$SECOND_CRITIC_PROMPT" \
     --allowedTools "Read,Grep,Glob,Write" \
     --max-turns 25 \
-    --output-format text \
-    > "$OUTPUT_DIR/second-critic-log.txt" 2>&1 || true
+    --verbose --output-format stream-json \
+    2> "$OUTPUT_DIR/second-critic-stderr.txt" \
+    | stream_claude_phase second-critic \
+    || true
 
-  if [ "$VERBOSE" = true ] && [ -f "$OUTPUT_DIR/second-critic-log.txt" ]; then
-    echo "  [verbose] Last 20 lines of second critic log:"
-    tail -20 "$OUTPUT_DIR/second-critic-log.txt"
+  if [ "$VERBOSE" = true ] && [ -f "$OUTPUT_DIR/second-critic-events.jsonl" ]; then
+    echo "  [verbose] Last 20 events of second critic stream:"
+    tail -20 "$OUTPUT_DIR/second-critic-events.jsonl"
     echo ""
   fi
 
   if [ ! -f "$OUTPUT_DIR/final-review.md" ]; then
     echo "  Warning: Second Critic didn't produce final-review.md"
-    echo "  Check $OUTPUT_DIR/second-critic-log.txt for details"
+    echo "  Check $OUTPUT_DIR/second-critic-events.jsonl and $OUTPUT_DIR/second-critic-stderr.txt for details"
   else
     echo "  Phase 4 complete"
     echo "    -> $OUTPUT_DIR/final-review.md"
@@ -486,21 +571,25 @@ RESOLVER_EOF
 
   RESOLVER_PROMPT="${RESOLVER_PROMPT//OUTPUT_DIR_PLACEHOLDER/$OUTPUT_DIR}"
 
+  rm -f "$OUTPUT_DIR/resolution-log.md"
+
   claude -p "$RESOLVER_PROMPT" \
     --allowedTools "Read,Write,Edit" \
     --max-turns 25 \
-    --output-format text \
-    > "$OUTPUT_DIR/resolver-log.txt" 2>&1 || true
+    --verbose --output-format stream-json \
+    2> "$OUTPUT_DIR/resolver-stderr.txt" \
+    | stream_claude_phase resolver \
+    || true
 
-  if [ "$VERBOSE" = true ] && [ -f "$OUTPUT_DIR/resolver-log.txt" ]; then
-    echo "  [verbose] Last 20 lines of resolver log:"
-    tail -20 "$OUTPUT_DIR/resolver-log.txt"
+  if [ "$VERBOSE" = true ] && [ -f "$OUTPUT_DIR/resolver-events.jsonl" ]; then
+    echo "  [verbose] Last 20 events of resolver stream:"
+    tail -20 "$OUTPUT_DIR/resolver-events.jsonl"
     echo ""
   fi
 
   if [ ! -f "$OUTPUT_DIR/resolution-log.md" ]; then
     echo "  Warning: Resolver didn't produce resolution-log.md"
-    echo "  Check $OUTPUT_DIR/resolver-log.txt for details"
+    echo "  Check $OUTPUT_DIR/resolver-events.jsonl and $OUTPUT_DIR/resolver-stderr.txt for details"
   else
     echo "  Phase 5 complete"
     echo "    -> $OUTPUT_DIR/final-spec.md (updated)"
