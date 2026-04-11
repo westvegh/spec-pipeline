@@ -135,13 +135,10 @@ echo "  PHASE 1: REFINER — Reconciling spec against codebase"
 echo "------------------------------------------------------"
 echo ""
 
-cp "$SPEC_PATH" "$OUTPUT_DIR/refined-spec.md"
-
 IFS= read -r -d '' REFINER_PROMPT <<'REFINER_EOF' || true
 You are the REFINER. Your job is to reconcile a feature spec against the real codebase.
 
-The original spec has already been copied to: OUTPUT_DIR_PLACEHOLDER/refined-spec.md
-You will edit that file in place. Read it first to see the content.
+Read the spec file at: SPEC_PATH_PLACEHOLDER
 
 Then systematically verify every claim the spec makes against the actual code. You have full read access to the codebase. Use the project's CLAUDE.md and any documentation files for context.
 
@@ -197,11 +194,10 @@ STEP 2 — WRITE THE REPORT (do this BEFORE any edits)
 
   This report MUST exist before you do any editing. If you run low on turns, the report is the thing that must survive — the edits can be redone from it later.
 
-STEP 3 — APPLY EDITS
-  Edit OUTPUT_DIR_PLACEHOLDER/refined-spec.md in place to fix every MISMATCH inline.
-  - Use the Edit tool for surgical fixes — do NOT rewrite the whole file with Write unless the changes are so pervasive that editing would be impractical.
-  - Before fixing a renamed type, field, or symbol, Grep the spec for ALL occurrences so you catch every instance, not just the first one.
-  - Do NOT fix MISSING or SUGGESTION items — just flag them in the report.
+STEP 3 — WRITE THE REFINED SPEC
+  Write the refined spec to: OUTPUT_DIR_PLACEHOLDER/refined-spec.md
+  This is the original spec with all MISMATCH issues fixed inline.
+  Do NOT fix MISSING or SUGGESTION items — just flag them in the report.
 
 Be thorough. Read actual source files. Don't guess — verify.
 REFINER_EOF
@@ -212,7 +208,7 @@ REFINER_PROMPT="${REFINER_PROMPT//OUTPUT_DIR_PLACEHOLDER/$OUTPUT_DIR}"
 rm -f "$OUTPUT_DIR/reconciliation-report.md"
 
 claude -p "$REFINER_PROMPT" \
-  --allowedTools "Read,Grep,Glob,Write,Edit" \
+  --allowedTools "Read,Grep,Glob,Write" \
   --max-turns 80 \
   --verbose --output-format stream-json \
   2> "$OUTPUT_DIR/refiner-stderr.txt" \
@@ -333,7 +329,7 @@ rm -f "$OUTPUT_DIR/critique-report.md"
 
 claude -p "$CRITIC_PROMPT" \
   --allowedTools "Read,Grep,Glob,Write" \
-  --max-turns 25 \
+  --max-turns 80 \
   --verbose --output-format stream-json \
   2> "$OUTPUT_DIR/critic-stderr.txt" \
   | stream_claude_phase critic \
@@ -366,26 +362,21 @@ else
   echo "------------------------------------------------------"
   echo ""
 
-  if [ -f "$OUTPUT_DIR/refined-spec.md" ]; then
-    cp "$OUTPUT_DIR/refined-spec.md" "$OUTPUT_DIR/final-spec.md"
-  else
-    cp "$SPEC_PATH" "$OUTPUT_DIR/final-spec.md"
-  fi
-
   IFS= read -r -d '' ASSEMBLER_PROMPT <<'ASSEMBLER_EOF' || true
 You are the ASSEMBLER. Your job is to produce the final, implementation-ready spec.
 
 You have three inputs:
-1. The reconciliation report: OUTPUT_DIR_PLACEHOLDER/reconciliation-report.md
-2. The critique report: OUTPUT_DIR_PLACEHOLDER/critique-report.md
-3. The working spec to edit: OUTPUT_DIR_PLACEHOLDER/final-spec.md
-   (This has already been seeded with the refined spec, or the original spec if refining failed.)
+1. The refined spec: OUTPUT_DIR_PLACEHOLDER/refined-spec.md
+2. The reconciliation report: OUTPUT_DIR_PLACEHOLDER/reconciliation-report.md
+3. The critique report: OUTPUT_DIR_PLACEHOLDER/critique-report.md
+
+If the refined spec doesn't exist, use the original spec at: SPEC_PATH_PLACEHOLDER
 
 Read all three.
 
 YOUR TASK:
 
-1. The working spec at OUTPUT_DIR_PLACEHOLDER/final-spec.md is your starting point — edit it in place.
+1. Start from the refined spec as the base.
 
 2. Address all CRITICAL findings from the critique report:
    - Fix them directly in the spec
@@ -417,7 +408,7 @@ The Assembler may NOT change:
 
 Any finding that would change UX behavior must become a DECISION NEEDED comment.
 
-Edit OUTPUT_DIR_PLACEHOLDER/final-spec.md in place. Use the Edit tool for surgical changes — do NOT rewrite the whole file with Write unless the changes are so pervasive that editing would be impractical. Before fixing a renamed symbol or recurring pattern, Grep the spec to catch every occurrence.
+Write the final spec to: OUTPUT_DIR_PLACEHOLDER/final-spec.md
 
 This spec should be ready to hand directly to an AI coding assistant for implementation.
 ASSEMBLER_EOF
@@ -426,8 +417,8 @@ ASSEMBLER_EOF
   ASSEMBLER_PROMPT="${ASSEMBLER_PROMPT//SPEC_PATH_PLACEHOLDER/$SPEC_PATH}"
 
   claude -p "$ASSEMBLER_PROMPT" \
-    --allowedTools "Read,Grep,Glob,Write,Edit" \
-    --max-turns 25 \
+    --allowedTools "Read,Write" \
+    --max-turns 80 \
     --verbose --output-format stream-json \
     2> "$OUTPUT_DIR/assembler-stderr.txt" \
     | stream_claude_phase assembler \
@@ -487,18 +478,7 @@ For each finding, state:
 - Why it matters for implementation
 - A suggested fix (if you have one)
 
-FOLLOW THIS ORDER STRICTLY — the review file must exist even if you run out of turns:
-
-STEP 1 — FIRST PASS
-  Read the spec once. Do a quick pass through the project's CLAUDE.md and the most obviously relevant source files.
-
-STEP 2 — WRITE AN INITIAL REVIEW (do this BEFORE deep investigation)
-  Write your best review so far to: OUTPUT_DIR_PLACEHOLDER/final-review.md
-  Include every finding you already have high confidence in. It's OK if the review is short at this point — the goal is to guarantee the file exists before you run out of turns.
-
-STEP 3 — DEEPEN AND REFINE
-  Now do deeper codebase exploration. As you confirm or discover findings, use Edit to update OUTPUT_DIR_PLACEHOLDER/final-review.md in place — add new findings, sharpen existing ones, remove any that turn out to be wrong.
-  If you run low on turns during this step, the initial review from Step 2 is still your safety net.
+Write your review to: OUTPUT_DIR_PLACEHOLDER/final-review.md
 SECOND_CRITIC_EOF
 
   SECOND_CRITIC_PROMPT="${SECOND_CRITIC_PROMPT//OUTPUT_DIR_PLACEHOLDER/$OUTPUT_DIR}"
@@ -506,8 +486,8 @@ SECOND_CRITIC_EOF
   rm -f "$OUTPUT_DIR/final-review.md"
 
   claude -p "$SECOND_CRITIC_PROMPT" \
-    --allowedTools "Read,Grep,Glob,Write,Edit" \
-    --max-turns 50 \
+    --allowedTools "Read,Grep,Glob,Write" \
+    --max-turns 80 \
     --verbose --output-format stream-json \
     2> "$OUTPUT_DIR/second-critic-stderr.txt" \
     | stream_claude_phase second-critic \
@@ -575,16 +555,18 @@ The Resolver may NOT change:
 
 Any finding that would require changing UX behavior must be classified as REQUIRES DECISION.
 
-PRODUCE TWO OUTPUTS:
+PRODUCE TWO OUTPUTS, IN THIS ORDER — the log is the most valuable artifact, so write it first:
 
-1. Overwrite the spec at: OUTPUT_DIR_PLACEHOLDER/final-spec.md
-   Apply all VALID fixes. Add DECISION NEEDED comments for REQUIRES DECISION items.
-
-2. Write the resolution log to: OUTPUT_DIR_PLACEHOLDER/resolution-log.md
+1. FIRST, write the resolution log to: OUTPUT_DIR_PLACEHOLDER/resolution-log.md
    For each finding from the review, list:
    - The finding (brief summary)
    - Classification: VALID, NITPICK, or REQUIRES DECISION
-   - Action taken (what you changed, or why you skipped it)
+   - Planned action (what you will change, or why you will skip it)
+
+   Write the log FIRST. If you run low on turns, the log is what must survive — the spec edits can be re-derived from it later.
+
+2. SECOND, overwrite the spec at: OUTPUT_DIR_PLACEHOLDER/final-spec.md
+   Apply all VALID fixes from the log. Add DECISION NEEDED comments for REQUIRES DECISION items.
 RESOLVER_EOF
 
   RESOLVER_PROMPT="${RESOLVER_PROMPT//OUTPUT_DIR_PLACEHOLDER/$OUTPUT_DIR}"
@@ -592,8 +574,8 @@ RESOLVER_EOF
   rm -f "$OUTPUT_DIR/resolution-log.md"
 
   claude -p "$RESOLVER_PROMPT" \
-    --allowedTools "Read,Write,Edit" \
-    --max-turns 25 \
+    --allowedTools "Read,Write" \
+    --max-turns 80 \
     --verbose --output-format stream-json \
     2> "$OUTPUT_DIR/resolver-stderr.txt" \
     | stream_claude_phase resolver \
