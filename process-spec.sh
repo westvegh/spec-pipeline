@@ -487,7 +487,18 @@ For each finding, state:
 - Why it matters for implementation
 - A suggested fix (if you have one)
 
-Write your review to: OUTPUT_DIR_PLACEHOLDER/final-review.md
+FOLLOW THIS ORDER STRICTLY — the review file must exist even if you run out of turns:
+
+STEP 1 — FIRST PASS
+  Read the spec once. Do a quick pass through the project's CLAUDE.md and the most obviously relevant source files.
+
+STEP 2 — WRITE AN INITIAL REVIEW (do this BEFORE deep investigation)
+  Write your best review so far to: OUTPUT_DIR_PLACEHOLDER/final-review.md
+  Include every finding you already have high confidence in. It's OK if the review is short at this point — the goal is to guarantee the file exists before you run out of turns.
+
+STEP 3 — DEEPEN AND REFINE
+  Now do deeper codebase exploration. As you confirm or discover findings, use Edit to update OUTPUT_DIR_PLACEHOLDER/final-review.md in place — add new findings, sharpen existing ones, remove any that turn out to be wrong.
+  If you run low on turns during this step, the initial review from Step 2 is still your safety net.
 SECOND_CRITIC_EOF
 
   SECOND_CRITIC_PROMPT="${SECOND_CRITIC_PROMPT//OUTPUT_DIR_PLACEHOLDER/$OUTPUT_DIR}"
@@ -495,8 +506,8 @@ SECOND_CRITIC_EOF
   rm -f "$OUTPUT_DIR/final-review.md"
 
   claude -p "$SECOND_CRITIC_PROMPT" \
-    --allowedTools "Read,Grep,Glob,Write" \
-    --max-turns 25 \
+    --allowedTools "Read,Grep,Glob,Write,Edit" \
+    --max-turns 50 \
     --verbose --output-format stream-json \
     2> "$OUTPUT_DIR/second-critic-stderr.txt" \
     | stream_claude_phase second-critic \
@@ -524,6 +535,13 @@ if [ "$SKIP_ASSEMBLY" = true ] || [ "$FULL" != true ]; then
   echo "------------------------------------------------------"
   echo "  PHASE 5: SKIPPED (use --full to enable)"
   echo "------------------------------------------------------"
+elif [ ! -f "$OUTPUT_DIR/final-review.md" ]; then
+  echo "------------------------------------------------------"
+  echo "  PHASE 5: SKIPPED (no final-review.md from Phase 4)"
+  echo "------------------------------------------------------"
+  echo ""
+  echo "  Phase 4 did not produce final-review.md — nothing to resolve."
+  echo "  Check $OUTPUT_DIR/second-critic-events.jsonl for why."
 else
   echo "------------------------------------------------------"
   echo "  PHASE 5: RESOLVER — Resolving review findings"
